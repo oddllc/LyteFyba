@@ -5,22 +5,11 @@
 #include "../common/comDefinitions.s43"			; Include the definitions common to monitor
 												; and TestICal
 
-;
-; ADCScaled or R(a)wVoltage ( channel -- measurement )
-; "channel" has channel number shifted left 12 bits.
-; e.g. CellVChan<<12, TempChan<<12, BoltVPlChan<<12, BoltVMiChan<<12.
-; "measurement" is 12-bit (0 to 4092) with voltage scale calibration applied,
-; which has units of 17/16 of a millivolt in the case of cell and bolt voltages.
-;
-		xCODE		'a',ADCScaled,_ADCScaled
-		mov			Rtos,R8
-		call		#MeasAndCorrCell		; Measure and use voltage scale/offset correction
-		mov			R10,Rtos
-		ret
-
 ; Some characters need to be translated into RAM adresses of calibration values
 		ALIGN	1
 calAddressTable
+		DB		'b' , ramBypFull	& $7F | $00
+		DB		'a' , ramAdcTimIdx	& $7F | $00
 		DB		'I' , ramBoltMiCal	& $7F | $80
 		DB		's' , ramTempSlope	& $7F | $80
 		DB		'O' , ramBoltPlOff	& $7F | $00
@@ -32,7 +21,6 @@ calAddressTable
 		DB		't' , ramTempOff	& $7F | $00	; clear for byte quantity
 		DB		'n' , ramBoltMiOff	& $7F | $00
 		DB		'i' , ramID			& $7F | $00
-		DB		'a' , ramAdcTimIdx	& $7F | $00
 		DB		'd' , ramDataVers	& $7F | $00	; Data vers is not for writing
 ; Zero must not appear in the table as it is used to represent "unrecognised".
 sizeCalAddressTable	EQU	$-calAddressTable
@@ -57,23 +45,6 @@ TranslateToCalAddr:
 		ret
 
 ;
-; Measure and possibly scale by 17/16th
-; Needed by 'v, 'b, 'o, 'O calibrate subcommands
-; The call to measure trashes R9,10
-;
-measure17:
-		call	#measure	; Get raw 12.2 bit fixed point measurement in R8
-		cmp.b	#255,&ID
-		_IF		NE			; If not a BMU then
-			; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
-			mov		R8,R9		; Copy the value
-			add		#8,R9		; Add half the divisor for rounding
-			rra4	R9			; Divide by 16
-			add		R9,R8		; Add back to the original
-		_ENDIF
-		ret
-
-;
 ; A worker routine for voltage calibration. We do this twice now for cell/battery and bolt/array
 ;
 
@@ -83,11 +54,10 @@ measure17:
 ; We want the calibration scale factor to be represented as an unsigned 1.15 fixed-point number
 ; i.e. a number with 1 integer bit and 15 fractional bits.
 ; So we shift the expected value 17 places left before the division.
+; R8 contains the measurement possibly scaled by 17/16
 ; R9 contains the relevant (cell or array/bolt) offset correction as a signed byte
+; The cal value is returned in R9
 voltScaleWork:
-			push	R9
-			call	#measure17					; Measure and possibly scale by 17/16; res in R8
-			pop		R9							; Restore offset correction
 			sxt		R9							; Convert from signed byte to signed word
 			add		R9,R8						; Perform offset correction, but not scale correction
 			clr		R9							; 16 bits of zeroes
@@ -110,41 +80,47 @@ voltScaleWork:
 ;
 			xCODE	'c',calibrate,_calibrate
 			_CASE
-			_OF_EQ_B	#'v',Rtos					; 'v': Cell voltage scale factor
+			_OF_EQ_B	#'v',Rtos				; 'v': Cell voltage scale factor
 				mov		#CellVChan<<12,R8			; ADC channel for scaled cell/battery voltage input
-				mov.b	&ramCellOff,R9				; This is the offset correction to use
+				call	#measure					; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov.b	&CellOff,R9					; This is the offset correction to use
 				call	#voltScaleWork
-				mov.w	R9,&ramCellCal				; Save cell/battery calibration value
+				mov.w	R9,&CellCal					; Save cell/battery calibration value
 			_ENDOF
 
-			_OF_EQ_B	#'V',Rtos					; 'b': Bolt+/Array voltage scale factor
+			_OF_EQ_B	#'V',Rtos				; 'V': Bolt+/Array voltage scale factor
 				mov		#BoltVPlChan<<12,R8			; ADC channel for scaled bolt/array voltage input
-				mov.b	&ramBoltPlOff,R9			; This is the offset correction to use
+				call	#measure					; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov.b	&BoltPlOff,R9				; This is the offset correction to use
 				call	#voltScaleWork
-				mov.w	R9,&ramBoltPlCal			; Save bolt/array calibration value
+				mov.w	R9,&BoltPlCal				; Save bolt/array calibration value
 			_ENDOF
 
-			_OF_EQ_B	#'o',Rtos					; 'o': Cell voltage offset
+			_OF_EQ_B	#'o',Rtos				; 'o': Cell voltage offset
 				mov		#CellVChan<<12,R8			; ADC channel for scaled cell/battery voltage input
-				call	#measure17					; Measure and possibly scale 17/16
-				mov		&ramCellCal,R9				; Use this voltage scale for correction
+				call	#measure					; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov		&CellCal,R9					; Use this voltage scale for correction
 				call	#Fx1_15UMul					; Correct for scale but not offset
 				sub		R8,Rsec						; Calculate offset (expected - measured)
-				mov.b	Rsec,&ramCellOff
+				mov.b	Rsec,&CellOff
 			_ENDOF
 
-			_OF_EQ_B	#'O',Rtos					; 'O': Bolt+/Array voltage offset
+			_OF_EQ_B	#'O',Rtos				; 'O': Bolt+/Array voltage offset
 				mov		#BoltVPlChan<<12,R8			; ADC channel for scaled bolt/array voltage input
-				call	#measure17					; Measure and possibly scale 17/16
-				mov		&ramBoltPlCal,R9			; Use this voltage scale for correction
+				call	#measure					; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov		&BoltPlCal,R9				; Use this voltage scale for correction
 				call	#Fx1_15UMul					; Correct for scale but not offset
 				sub		R8,Rsec						; Calculate offset (expected - measured)
-				mov.b	Rsec,&ramBoltPlOff
+				mov.b	Rsec,&BoltPlOff
 			_ENDOF
 
-			_OF_EQ_B	#'t',Rtos					; 't': Temperature offset
+			_OF_EQ_B	#'t',Rtos				; 't': Temperature offset
 				call	#GetTemp					; Get calibrated temp in half degC into R9
-				mov.b	&ramTempOff,R8				; Subtract off our existing offset calibration
+				mov.b	&TempOff,R8					; Subtract off our existing offset calibration
 				sxt		R8
 				sub		R8,R9
 				push	R9							; Save uncalibrated measurement in half degrees
@@ -157,13 +133,12 @@ voltScaleWork:
 				pop		R8							; Restore uncal'd measurement
 				sub		R8,R9						; Subtract measured half degrees from calibration
 													; (expected) temperature
-				mov.b	R9,&ramTempOff				; Save new temperature offset calibration value
+				mov.b	R9,&TempOff					; Save new temperature offset calibration value
 			_ENDOF
 
-			_OF_EQ_B		#'n',Rtos				; 'n': Bolt-/Shuntx20 voltage offset. Was "link" offset
-				mov		#BoltVMiChan<<12,R8
+			_OF_EQ_B	#'n',Rtos				; 'n': Bolt-/Shuntx20 voltage offset. Was "link" offset
 				call	#MeasAndCorrBoltMi			; Measure and correct using the BoltMi corrections
-				mov.b	&ramBoltMiOff,R9			; Subtract the existing offset (signed byte)
+				mov.b	&BoltMiOff,R9				; Subtract the existing offset (signed byte)
 				sxt		R9
 				sub		R9,R10
 				sub		#2046,R10					; Zero volts is a 2046 reading
@@ -189,7 +164,7 @@ voltScaleWork:
 				_OR_IFS		GE						; or >= $80
 					mov		#$80,R10					; Use $80 to indicate "not calibrated"
 				_ENDIF
-				mov.b	R10,&ramBoltMiOff			; Save the bolt-/current offset calibration value
+				mov.b	R10,&BoltMiOff				; Save the bolt-/current offset calibration value
 			_ENDOF
 
 			_OF_EQ_B	#'i',Rtos
@@ -203,7 +178,7 @@ voltScaleWork:
 				bit.b	#bDontEcho,&interpFlags
 				_IF		NZ					; If the dont-echo flag is set
 					; Save our new ID to RAM
-					mov.b	Rtos,&ramID
+					mov.b	Rsec,&ID
 
 					; Send another setIDs command with its parameter incremented by one.
 					mov		Rsec,Rtos
@@ -221,28 +196,82 @@ voltScaleWork:
 				ret			; Don't fall through to _readCalValue
 			_ENDOF
 
-			_OF_EQ		#'a',Rtos					; 'a': optimal ADC timing, with debug display
-				call	#FindOptAdc					; 4 results in R8 R9 R10 R11
-				push	R11
-				push	R10
-				push	R9
-				mov		#'M'|'2'<<8,Rthd		; M2 for MCLK/2
-				mov		R8,Rsec
-				mov		#5,Rtos
-				call	#_prettyPrint
-				mov		#'O'|'2'<<8,Rthd		; O2 for ADCOSC/2
+			_OF_EQ_B	#'a',Rtos				; 'a': optimal ADC timing, with debug display
+				call	#FindOptAdc					; Find the optimum ADC clock
+				sub		#2*NumAdcClocks+2,SP		; Recover the devThisIdx array from FindOptAdc
+													; The +2 is for the old return address
+				mov		#'M'|'2'<<8,Rthd			; M2 for MCLK/2
 				pop		Rsec
 				mov		#5,Rtos
 				call	#_prettyPrint
-				mov		#'O'|'3'<<8,Rthd		; O3 for ADCOSC/3
+
+				mov		#'O'|'2'<<8,Rthd			; O2 for ADCOSC/2
 				pop		Rsec
 				mov		#5,Rtos
 				call	#_prettyPrint
-				mov		#'O'|'4'<<8,Rthd		; O4 for ADCOSC/4
+
+				mov		#'O'|'3'<<8,Rthd			; O3 for ADCOSC/3
 				pop		Rsec
 				mov		#5,Rtos
 				call	#_prettyPrint
-				mov.b	#'a',Rtos
+
+				mov		#'O'|'4'<<8,Rthd			; O4 for ADCOSC/4
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+ 				mov		#'O'|'5'<<8,Rthd			; O5 for ADCOSC/5
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'6'<<8,Rthd			; O6 for ADCOSC/6
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'7'<<8,Rthd			; O7 for ADCOSC/7
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'8'<<8,Rthd			; 08 for ADCOSC/8
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'3'<<8,Rthd			; M3 for MCLK/3
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'4'<<8,Rthd			; M4 for MCLK/4
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'5'<<8,Rthd			; M5 for MCLK/5
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'6'<<8,Rthd			; M6 for MCLK/6
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'7'<<8,Rthd			; M7 for MCLK/7
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'8'<<8,Rthd			; M8 for MCLK/8
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				add		#2,SP						; Drop the old FindOptAdc return address
+				mov.b	#'a',Rtos					; Restore the calibration-type character
 				; Fall through to readCalValue to display the winner
 			_ENDOF
 ;
@@ -261,34 +290,40 @@ voltScaleWork:
 ; Read calibration value ( ch --- )
 ; Calibration type (e.g. 'v' for cell Voltage) in ch
 			xCODE	'r',readCalValue,_readCalValue
-			call 	#TranslateToCalAddr
-			mov.b	Rtos,Rsec				; Convert to RAM address in Rsec
-			bic.b	#$80,Rsec
-			or_w	#ramDataStart&$FF80,Rsec ; Copy higher bits from immediate address
+			call 	#TranslateToCalAddr		; Convert letter to byte/word flag and low 7 bits of address
+			mov.b	Rtos,Rsec				; Copy to Rsec
+			bic.b	#$80,Rsec				; Strip the byte/word flag
+			or_w	#ramDataStart&$FF80,Rsec ; OR the upper 9 bits to make it a RAM address
 			tst.b	Rtos
 			_IF		NZ						; If not zero (zero means "unrecognised")
-				_IF		NN						; If high bit clear
+				push.b	&interpFlags			; Save present number base
+				_IF		NN						; If high bit clear it's a byte
 					mov		#3,Rtos					; Display 3 digits
+					cmp		#ramAdcTimIdx+1,Rsec	; Test for ADC timing index or BypFull
 					mov.b	@Rsec,Rsec				; Get byte sized cal value
-				_ELSE							; Else high bit set so
+					_IF		LO						; If we're reading ADC timing index or BypFull
+						bis.b	#bHexOutput,&interpFlags ; Set to hexadecimal output
+					_ENDIF
+				_ELSE							; Else high bit set so it's a word
 					mov		#5,Rtos					; Display 5 digits
-					cmp		#infoCapacity,Rsec		; Test for battery capacity
+					cmp		#ramCapacity,Rsec		; Test for battery capacity
 					mov.w	@Rsec,Rsec				; Get word sized cal value
-					_IF		EQ
+					_IF		EQ						; If we're reading capacity
 						mov		Rsec,R9
 						clr		R10
-						mov		#10,R8				; Divide by 10 to bring to whole Ah
-						call	#UMSlashMod
+						mov		#10,R8					; Divide by 10 to bring to whole Ah
+						call	#UMSlashMod				; R10:R9 / R8 -> R9
 						mov		R9,Rsec
 					_ENDIF
-				_ENDIF							; Endif high bit
+				_ENDIF							; Endif high bit set
+				mov.b		#' ',Rthd			; Cmd type char (space). May be r or c command
+				call	 	#_prettyPrint
+				popBits_B	#bHexOutput,&interpFlags ; Restore previous number base
 			_ELSE 							; Else is zero for "unrecognised"
 EmitQmark
 				mov		#QuestionStr,R10
 				br		#TxString			; Print \? <ret> and exit
 			_ENDIF							; Endif unrecognised
-			mov.b		#' ',Rthd			; Cmd type char (space). May be r or c command
-			call	 	#_prettyPrint
 			ret
 
 QuestionStr	DB			3,'\\?\r'			; Initial \ because '?' is a peek command
@@ -311,16 +346,16 @@ TickIcStr	DB			3,'\'ic'			; 'ic command to send downstream
 ; e.g. at 30 degC, divide the measurement by 1.25 to obtain HiTempCellRes.
 
 			xCODE	'w',writeCalValue,_writeCalValue
-			cmp		#'d',Rtos				; Don't allow data version to be changed like this
+			cmp.b	#'d',Rtos				; Don't allow data version to be changed like this
 			_IF		EQ
 				jmp		EmitQmark
 			_ENDIF
-			call 	#TranslateToCalAddr
-			mov.b	Rtos,R9					; Convert to RAM address in R9
-			bic.b	#$80,R9
-			bis		#$200,R9				; Start of RAM
-			cmp		#ramCapacity,R9			; Check for battery capacity
-			_IF		EQ						; If so
+			call 	#TranslateToCalAddr		; Convert letter to byte/word flag and low 7 bits of address
+			mov.b	Rtos,R10				; Copy to R10
+			bic.b	#$80,R10				; Strip the byte/word flag
+			or_w	#ramDataStart&$FF80,R10	; OR the upper 9 bits to make it a RAM address
+			cmp		#ramCapacity,R10
+			_IF		EQ						; If we're writing battery capacity
 				rla		Rsec					; Multiply given value by 10
 				mov		Rsec,R8					; to bring to tenths of an Ah
 				rla2	Rsec					; *8
@@ -329,14 +364,14 @@ TickIcStr	DB			3,'\'ic'			; 'ic command to send downstream
 			tst.b	Rtos
 			_IF		NZ						; If not zero for "unrecognised"
 				_IF		NN						; If high bit clear
-					mov.b	Rsec,0(R9)				; Set byte sized cal value
+					mov.b	Rsec,0(R10)				; Set byte sized cal value
 				_ELSE							; Else high bit set so
-					mov.w	Rsec,0(R9)				; Set word sized cal value
+					mov.w	Rsec,0(R10)				; Set word sized cal value
 				_ENDIF							; Endif high bit
-				cmp	#ram8MHzCalD,R9
+				cmp	#ram8MHzCalD,R10
 				_IF		EQ
-					mov.b	@R9+,&DCOCTL
-					mov.b	@R9,&BCSCTL1
+					mov.b	@R10+,&DCOCTL
+					mov.b	@R10,&BCSCTL1
 				_ENDIF
 			_ELSE 							; Else is zero for "unrecognised"
 				jmp		EmitQmark
@@ -376,7 +411,7 @@ TickIcStr	DB			3,'\'ic'			; 'ic command to send downstream
 			; Check that the flash programming worked
 			;
 			call	#compareInfoFlash		; Compare RAM cal data with what's in infoflash
-			_IF    NE
+			_IF		NE
 				mov	#b'1010000000000000,R8	; 2 flashes
 				br		#jErrorFlash		; Infinite loop, never returns
 			_ENDIF
@@ -649,4 +684,19 @@ TranslateToManAddr:
 			bic.b	#1<<3,P1DIR				; Set as input
 			ret
 
+;
+; Measure Vcc ( -- )	; Emit the Vcc voltage in millivolts
+;
+		xCODE	'M'|'v' <<8,MeasVcc,_MeasVcc	; 'Mv' collides with 'Mf' 'Mn' 'Uv' 'Uf' 'Un'
+		xCODE	'o',MeasVcc2,_MeasVcc2			; 'o' alias to allow keyboard auto-repeat when testing
+		call	#MeasAndCorrVcc			; Gives us 0-4092 in R10, for 0-1.5 V
+		mov		R10,R8
+		mov		#48047,R9				; 3000/4092*65536
+		call	#UMStar					; R10:R9 = R8 * R9
+		rla		R9						; Do rounding
+		adc		R10
+		mov		#'M'|'v' <<8,Rthd		; Type is Vcc Measurement
+		mov		R10,Rsec				; Result in millivolts
+		mov		#4,Rtos					; Print 4 digits
+		br		#_prettyPrint			; Tail-call pretty-print and return
 

@@ -14,16 +14,23 @@
 ; Perform an analogue measurement without calibration.
 
 measure:
-			; INCHx		= R8 has the channel number already in the right position
-			; For other bits, see the adcTimingTbl below
-			mov.b		&AdcTimIdx,R9
-			cmp			#4+1,R9						; Test the ADC timing index
-			_IF			HS							; If not valid (not 0-4)
-				clr			R9							; Then use default timing (index = 0)
+			; Initialise ADC10CTL1
+			; R8 has the channel number already in the INCHx position
+			; and has SHSx, ADC10DF and ISSH all set to zero.
+			; INCHx		= channel number to convert
+			; SHS_0		= enable software starting via the ADC10SC bit
+			; &~ADC10DF	= straight binary output, not twos complement.
+			; &~ISSH	= the sample input signal is not inverted
+			; For the LSB of ADC10CTL1, see the comments for AdcTimingTbl below.
+			mov.b	&AdcTimIdx,R9
+			and		#$0F,R9						; MS nibble is for Monolith. LS nibble is for TestICal
+			cmp		#NumAdcClocks+1,R9			; Test the ADC timing index
+			_IF		HS							; If not in the range 0 to NumAdcClocks
+				clr		R9							; Then use default timing (index = 0)
 			_ENDIF
-			mov.b		adcTimingTbl(R9),R9			; Get byte value from table
-			bis			R9,R8						; OR in the timing bits with given channel bits
-			mov			R8,&ADC10CTL1
+			mov.b	AdcTimingTbl(R9),R9			; Get byte value from table
+			or_w	R9,R8						; OR in the timing bits with given channel bits
+			mov		R8,&ADC10CTL1				; Put the result into ADC10CTL1
 
 #if !ADCBUF
 			; This is the standard version, which doesn't use any RAM.
@@ -42,10 +49,8 @@ measure:
 
 			bis			#ADC10ON,&ADC10CTL0
 ;			bis			#ADC10ON|ADC10SHT_2,&ADC10CTL0		; Also use 16 clock sample
-			; INCH		= R8 has the input channel number already in the right position
-			; SHS_0		= enable software starting via the ADC10SC bit
 
-			; Wait at least 30 us (= 120 cycles at 4 MHz) after REFON, for the reference to settle
+;			; Wait at least 30 us (= 120 cycles at 4 MHz) after REFON, for the reference to settle
 ;			_FOR			#40,R8					; 40 times around a 3 cycle dec jnz loop
 ;			_NEXT_DEC		R8
 
@@ -124,28 +129,53 @@ measure:
 
 ; The following table has the important timing bits for ADC10CTL1. It happens that they are
 ; all in the lower 8 bits, so this is a table of bytes.
-			; SHS_0		= enable software starting via the ADC10SC bit
 			; ADC10DIV_1 = divide input clock by 2 for ADC10CLK
 			; ADC10DIV_2 = divide input clock by 3 for ADC10CLK
             ; ADC10DIV_7 = divide input clock by 8 for ADC10CLK
-			; ADC10SSEL_0 = choose internal ADC clock (3-6 MHz) as input to ADC10CLK divider
-			; ADC10SSEL_2 = choose MCLK (4 MHz) as input to ADC10CLK divider
+			; ADC10SSEL_0 = choose internal ADC RC oscillator (3 to 6 MHz) as input to ADC10CLK divider
+			; ADC10SSEL_2 = choose MCLK (3.6864 MHz) as input to ADC10CLK divider
 			; CONSEQ_0	= single channel single conversion
 
-			; We found years ago that ADC10OSC/3 distributes noise particularly from SMCLK better, for
-			; more consistent ADC readings. But now they seem more noisy, especially for the Bolt+
-			; reading
-DFLT_ADC_TIMING	equ	ADC10DIV_2|ADC10SSEL_0|CONSEQ_0
-adcTimingTbl DB		DFLT_ADC_TIMING							; value = 0, default
-			DB		SHS_0+ADC10DIV_1|ADC10SSEL_2|CONSEQ_0	; 1 = MCLK/2
-			DB		SHS_0+ADC10DIV_1|ADC10SSEL_0|CONSEQ_0	; 2 = ADC10OSC/2 (may be too fast)
-			DB		SHS_0+ADC10DIV_2|ADC10SSEL_0|CONSEQ_0	; 3 = ADC10OSC/3
-			DB		SHS_0+ADC10DIV_3|ADC10SSEL_0|CONSEQ_0	; 4 = ADC10OSC/4
+			; We found years ago that ADC10OSC/3 distributes noise particularly from SMCLK better,
+			; for more consistent ADC readings. But now they seem more noisy, especially for the
+			; Bolt+ reading. ADC10CLK should not be faster than 1.67 MHz or slower than 0.15 MHz.
+DFLT_ADC_TIMING	equ	ADC10DIV_5|ADC10SSEL_2|CONSEQ_0	; Best for TestICal, with 40 ms between
+													; measurements, is MCLK/6 (index 12)
+AdcTimingTbl DB		DFLT_ADC_TIMING					; 0 = default, lowest worst-case noise
+			DB		ADC10DIV_1|ADC10SSEL_2|CONSEQ_0	; 1 = MCLK/2	 (may be too fast)
+			DB		ADC10DIV_1|ADC10SSEL_0|CONSEQ_0	; 2 = ADC10OSC/2 (may be too fast)
+			DB		ADC10DIV_2|ADC10SSEL_0|CONSEQ_0	; 3 = ADC10OSC/3 (may be too fast)
+			DB		ADC10DIV_3|ADC10SSEL_0|CONSEQ_0	; 4 = ADC10OSC/4
+			DB		ADC10DIV_4|ADC10SSEL_0|CONSEQ_0	; 5 = ADC10OSC/5
+			DB		ADC10DIV_5|ADC10SSEL_0|CONSEQ_0	; 6 = ADC10OSC/6
+			DB		ADC10DIV_6|ADC10SSEL_0|CONSEQ_0	; 7 = ADC10OSC/7
+			DB		ADC10DIV_7|ADC10SSEL_0|CONSEQ_0	; 8 = ADC10OSC/8
+			DB		ADC10DIV_2|ADC10SSEL_2|CONSEQ_0	; 9 = MCLK/3
+			DB		ADC10DIV_3|ADC10SSEL_2|CONSEQ_0	; 10 = MCLK/4
+			DB		ADC10DIV_4|ADC10SSEL_2|CONSEQ_0	; 11 = MCLK/5
+			DB		ADC10DIV_5|ADC10SSEL_2|CONSEQ_0	; 12 = MCLK/6
+			DB		ADC10DIV_6|ADC10SSEL_2|CONSEQ_0	; 13 = MCLK/7
+			DB		ADC10DIV_7|ADC10SSEL_2|CONSEQ_0	; 14 = MCLK/8
 			align	1
+
+;
+; Scale R8 by 17/16 if we're not a BMU
+; Trashes R9
+;
+Mul17Div16Cmu:
+		cmp.b	#255,&ID
+		_IF		NE			; If not a BMU then
+			; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
+			mov		R8,R9		; Copy the value
+			add		#8,R9		; Add half the divisor for rounding
+			rra4	R9			; Divide by 16
+			add		R9,R8		; Add back to the original
+		_ENDIF
+		ret
 
 ; Measure and Correct routines
 ; Input:  R8  = analog channel number shifted left 12 bits.
-; Output: R10 = 12-bit measurement result with scale calibration applied.
+; Output: R10 = 12-bit measurement result with scale and offset calibration applied.
 ; Trashes: R8, R9, R11
 ;
 ; Correct the value for scale by multiplying the sum-of-samples by the voltage calibration scale factor
@@ -159,7 +189,10 @@ adcTimingTbl DB		DFLT_ADC_TIMING							; value = 0, default
 ;
 ; Used for battery voltage measurement in a BMU
 MeasAndCorrCell:
-			call		#measure				; 12.2 fixed-point result in R8
+			mov			#CellVChan<<12,R8	    ; Shifted ADC channel for CellV voltage divider
+            call		#measure				; 12.2 fixed-point result in R8
+			call		#Mul17Div16Cmu			; Scale by 17/16 if we're not a BMU
+MeasAndCorr:                                    ; Alternative entry point for Vcc measurement
 			mov.w		&CellCal,R9				; Get cell voltage calibration word as multiplicand in R9
 												; Multiplier is sum-of-samples, already in R8
 			call		#UMStar					; Gives unsigned product in R10 (hi word) and R9 (lo)
@@ -174,7 +207,9 @@ MeasAndCorrCell:
 ; Used for PV array voltage measurement, or Capacitor measurement during precharge, in a BMU
 ; Trashes R8-11
 MeasAndCorrBoltPl:
+			mov			#BoltVPlChan<<12,R8     ; Shifted ADC channel for BoltVPl voltage divider
 			call		#measure				; 12.2 fixed-point result in R8
+			call		#Mul17Div16Cmu			; Scale by 17/16 if we're not a BMU
 			mov.w		&BoltPlCal,R9			; Get bolt+ voltage scale factor as multiplicand in R9
 			cmp.w		#$FFFF,R9				; Check if it doesn't exist, i.e. just erased flash
 			_IF			EQ						; If it doesn't exist
@@ -192,6 +227,7 @@ MeasAndCorrBoltPl:
 ; As above, using the separate bolt calibration factor and offset
 ; Used for current measurements in a BMU
 MeasAndCorrBoltMi:
+			mov			#BoltVMiChan<<12,R8	    ; Shifted ADC channel for BoltMi input
 			call		#measure				; 12.2 fixed-point result in R8
 			mov.w		&BoltMiCal,R9			; Get bolt- voltage scale factor as multiplicand in R9
 			cmp.w		#$FFFF,R9				; Check if it doesn't exist, i.e. just erased flash
@@ -207,20 +243,17 @@ MeasAndCorrBoltMi:
 			add			R9,R10					; Add the offset calibration value
 			ret									; Finished
 
+MeasAndCorrVcc:
+			mov			#$B<<12,R8	    		; Shifted ADC channel for internal half-supply divider
+			call		#measure				; 12.2 fixed-point result in R8
+			jmp			MeasAndCorr				; Tail call and return
+
+
 GetBatV:
 GetCellV:
 ; Trashes: R8, R9, R11
 ; Output: R10 = calibrated in millivolts, approx range 0 to 4348
-			mov		#CellVChan<<12,R8
 			call	#MeasAndCorrCell
-			cmp.b	#255,&ID
-			_IF		NE			; If not a BMU then
-				; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
-				mov		R10,R8		; Copy the value
-				add		#8,R8		; Add half the divisor for rounding
-				rra4	R8			; Divide by 16
-				add		R8,R10		; Add back to the original
-			_ENDIF
 			ret
 
 
@@ -229,16 +262,7 @@ GetArrayV:
 GetBoltPlV:
 ; Trashes: R8, R9, R11
 ; Output: R10 = calibrated in millivolts, approx range 0 to 4348
-			mov		#BoltVPlChan<<12,R8
 			call	#MeasAndCorrBoltPl
-			cmp.b	#255,&ID
-			_IF		NE			; If not a BMU then
-				; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
-				mov		R10,R8		; Copy the value
-				add		#8,R8		; Add half the divisor for rounding
-				rra4	R8			; Divide by 16
-				add		R8,R10		; Add back to the original
-			_ENDIF
 			ret
 
 
@@ -246,7 +270,7 @@ GetTemp:
 ; Output: R10 = calibrated temperature in correctly rounded degrees Celsius, approx range -50..100
 ; Also R9 = calibrated temperature in correctly rounded half degrees.
 ; Trashes: R8, R11
-				; In the below, or with ADC10DIV_7, which forces the measurement to use slowest (/8) clock
+			; In the below, OR with ADC10DIV_7, which forces the measurement to use slowest (/8) clock
 			mov		#TempChan<<12|ADC10DIV_7,R8
 			call	#measure				; 12.2 significant fixed-point result in R8, in 14.2
 											; This is 4 bits shifted compared to a single measurement,
@@ -284,7 +308,6 @@ GetBoltMiV:
 			_IF			EQ				; If BoltMi offset calibration value is $80
 				mov		#9999,R10			; then use special value
 			_ELSE
-				mov			#BoltVMiChan<<12,R8	; Shifted ADC channel for BoltMi input
 				call		#MeasAndCorrBoltMi	; Measure and correct using BoltMi corrections
 				; Bolt- voltage measurement in mV
 				; Circuit has 2:1 voltage divider with Vref at the bottom.

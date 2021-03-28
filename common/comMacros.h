@@ -126,6 +126,76 @@ rla6		MACRO  dest
 			rla	dest
 			ENDM
 
+rra2_b		MACRO  dest
+			rra.b	dest
+			rra.b	dest
+			ENDM
+
+rra3_b		MACRO  dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			ENDM
+
+rra4_b		MACRO  dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			ENDM
+
+rra5_b		MACRO  dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			ENDM
+
+rra6_b		MACRO  dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			rra.b	dest
+			ENDM
+
+rla2_b		MACRO  dest
+			rla.b	dest
+			rla.b	dest
+			ENDM
+
+rla3_b		MACRO  dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			ENDM
+
+rla4_b		MACRO  dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			ENDM
+
+rla5_b		MACRO  dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			ENDM
+
+rla6_b		MACRO  dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			rla.b	dest
+			ENDM
+
 ClearWatchdog MACRO
 #if WATCHDOG
 			mov.w	#WDTPW+WDTCNTCL,&WDTCTL	; Clear and restart watchdog timer 32k cyc. BSL sets 64 cyc.
@@ -161,6 +231,34 @@ rla8_l		MACRO	hi,lo
 			swpb	hi
 			mov.b	lo,lo
 			swpb	lo
+			ENDM
+
+rra4_l		MACRO	hi,lo
+			REPT	4
+				rra		hi
+				rrc		lo
+			ENDR
+			ENDM
+
+rla4_l		MACRO	hi,lo
+			REPT	4
+				rla		lo
+				rlc		hi
+			ENDR
+			ENDM
+
+rra3_l		MACRO	hi,lo
+			REPT	3
+				rra		hi
+				rrc		lo
+			ENDR
+			ENDM
+
+rla3_l		MACRO	hi,lo
+			REPT	3
+				rla		lo
+				rlc		hi
+			ENDR
 			ENDM
 
 or_w		MACRO	src,dest

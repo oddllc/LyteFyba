@@ -76,7 +76,7 @@ ID			EQU		ramID			; We use the ram copy of the ID for s, x, prettyPrint
 									; commands. Monitor uses the info-flash copy
 
 ; Some definitions so the measure.s43 code will work
-; Monitor defines these as their info-flash counterparts instead of ram
+; Monitor and Monolith define these as their info-flash counterparts instead of ram
 CellCal 	EQU	ramCellCal
 CellOff		EQU ramCellOff
 BoltPlCal 	EQU	ramBoltPlCal
@@ -86,6 +86,7 @@ BoltMiOff	EQU ramBoltMiOff
 TempSlope	EQU	ramTempSlope
 TempOff		EQU	ramTempOff
 AdcTimIdx	EQU	ramAdcTimIdx
+BypFull		EQU	ramBypFull
 			LSTOUT-
 #include "msp430.h"							// MSP430 Special Function Register definitions
 #include "../common/ControlFlowMacros.h"	// Provides structured control-flow for assembly language
@@ -149,7 +150,7 @@ sampleBuf	DS		2*NumSamples	; ADC sample buffer; 4 or 16 samples
 ; Same order as stored in info-flash
 			ALIGNRAM 1				; So word values are word-aligned
 ramDataStart
-				DS		1			; Spare, but have to start on a word boundary
+ramBypFull		DS		1			; MS nibble is bypass stress level. LS nibble is full stress level
 ramAdcTimIdx	DS		1			; ADC timing table index: 0=default, 1=MCLK2, 3=ADCOSC/3
 ramBoltMiCal	DS		2			; Bolt- voltage / current scale calibration word
 ramTempSlope	DS		2			; Precomputed slope of voltage vs temperature curve
@@ -477,38 +478,63 @@ newChip:
 
 
 ;
-; Determine the best ADC clock value for this CMU.
-; Assumes the CMU is bolted to a cell carrying no current so v and V measure the same solid voltage.
-; Can't be used for BMUs unless v and V (HazBat & HazArr) are arranged to measure the same thing.
+; Determine the best ADC clock value for this CMU when running TestICal.
+; Assumes the CMU is bolted to a cell carrying no current so v and V measure a constant voltage.
+; Can be used for BMUs if v and V (HazBat & HazArr) are measuring a constant voltage of 48 V or more.
 ; Trashes R8-12, R13, R15
 ;
+FindOptAdc:
+
 ; Local variable stack pointer offsets
 actCellV	EQU		0					; Our best guess of the actual cell voltage, which is the
-										; average of 256 measurements using GetCellV and MCLK/2
+										; average of 256 measurements using GetCellV and MCLK/3
 										; Also used as a 32-bit sum of these values to find the average
 										; The deviations from this are used to determine the noise
-devThisIdx EQU	4						; Array of 4 total deviation word-sized results
+devThisIdx	EQU		4					; Array of total deviation word-sized results
 
-FindOptAdc:
-			sub		#4+8,SP				; Space for locals
+; Conditional assembly used during testing
+#define		USE_CELLV 0					; Set this if you want to use CellV instead of BoltPlV
+										; We normally use BoltPlV because it is more noisy
+numMeasures	EQU		16					; How many measurements to make with each clock. A power of 2.
+logNumMeas	EQU		4					; Base 2 log of the above. 'ac takes 0.6 seconds per measure.
+
+			sub		#4+2*NumAdcClocks,SP	; Make space for locals
 			mov		SP,R9
-			_FOR		#6,R12				; 6 words (2+4)
+			_FOR	#2+NumAdcClocks,R12
 				clr		0(R9)				; Clear locals
 				incd	R9
 			_NEXT_DEC	R12
-			mov.b	#1,&ramAdcTimIdx	; Measure cell voltage with MCLK/2 timing since it has the
-										; lowest worst-case noise
-			_FOR		#256,R12
-				; We use CellV here because it is a less noisy measurement than BoltVPl,
-				; because its track on a CMU has a more shielded route.
-				call	#GetCellV
+			; Measure using the timing that has the lowest worst-case noise for TestICal
+			and.b	#$F0,&ramAdcTimIdx	; Set LS nibble to zero without disturbing MS nibble
+			_FOR	#numMeasures,R12	; Do this many measurements
+				; We use BoltPlV because it is a noiser measurement than CellV,
+				; because its track on a CMU runs parallel to some noisy other tracks.
+				; We used to use CellV here, but we need to use the same measurement we use below
+				; in case they have different readings e.g. because they are calibrated differently.
+#if USE_CELLV
+				call	#GetCellV			; Little-v is less noisy
+#else
+				call	#GetBoltPlV			; Big-V is more noisy
+#endif
 				add		R10,actCellV(SP)	; Accumulate sum
 				adc		actCellV+2(SP)		; as 32-bit
+				mov		#40,R8				; Wait 40 ms for next measurement
+				call	#DelayMs
 			_NEXT_DEC	R12
-			mov		actCellV+2(SP),R10	; Sum to R10:R9
+			; Find the average
+			mov		actCellV+2(SP),R10	; Get sum into R10:R9
 			mov		actCellV(SP),R9
-			add		#128,R9				; Rounding
-			rra8_l	R10,R9				; Then shift right 8 bits using macro to divide by 256
+			add		#numMeasures/2,R9	; Rounding
+			adc		R10
+#if logNumMeas == 8
+			rra8_l	R10,R9				; Shift longword right 8 bits using macro, to divide by 256
+#else
+		REPT	logNumMeas				; Shift longword right the required number of bits
+			clrc						; Unsigned
+			rrc		R10
+			rrc		R9
+		ENDR
+#endif
 			mov		R9,actCellV(SP)		; Save average cell voltage as the actual word value in mV
 			; We want the best total deviation from the "actual" cell voltage. We use the total
 			; rather than the worst deviation since we've observed some infrequent large errors, and
@@ -516,24 +542,31 @@ FindOptAdc:
 			; Take 256 measurements, and sum their deviations from actual in sumOfDev. We don't bother
 			; dividing by 256, so there won't be an overflow of 16 bits unless the average error is
 			; 256 mV or more.
-			clr		R15					; R15 will range 0-3
+			clr		R15					; R15 will range 0 to NumAdcClocks-1
 			mov		SP,R13
 			add		#devThisIdx,R13		; R13 points to the start of the devThisIdx array
 			_REPEAT
 				mov		R15,R8
-				inc		R8					; R8 is 1-4
-				mov.b	R8,&ramAdcTimIdx	; Use this ADC timing
-				_FOR		#256,R12			; Do 128 measurements
-					; We use BoltPlV here because it is a noiser measurement than CellV,
+				inc		R8					; R8 is 1 to NumAdcClocks
+				and.b	#$F0,&ramAdcTimIdx	; Set LS nibble to zero without disturbing MS nibble
+				or_b	R8,&ramAdcTimIdx	; Put ADC timing to be tested into LS nibble
+				_FOR	#numMeasures,R12	; Do this many measurements
+					; We use BoltPlV because it is a noiser measurement than CellV,
 					; because its track on a CMU runs parallel to some noisy other tracks.
-					call	#GetBoltPlV			; V is the noisy measurement
+#if USE_CELLV
+					call	#GetCellV			; Little-v is less noisy
+#else
+					call	#GetBoltPlV			; Big-V is more noisy
+#endif
 					sub		actCellV(SP),R10	; Get deviation from average
 					abs		R10					; Don't care if pos or neg
 					add		R10,0(R13)			; Accumulate the sum of the deviations into the array
+					mov		#40,R8				; Wait 40 ms for next measurement
+					call	#DelayMs
 				_NEXT_DEC	R12
 				incd	R13					; Point to next array entry
 				inc		R15					; Next index
-				cmp		#4,R15
+				cmp		#NumAdcClocks,R15
 			_UNTIL	EQ
 			; Now find the quietest result
 			clr		R15
@@ -548,18 +581,15 @@ FindOptAdc:
 					mov		R15,R10				; Remember the table index
 				_ENDIF
 				inc		R15
-				cmp		#4,R15
+				cmp		#NumAdcClocks,R15
 			_UNTIL	EQ
 
 			; The lowest noise result was with a table index of R10, corresponding to an ADC timing
 			; index of R10+1
 			add		#1,R10
-			mov.b	R10,&ramAdcTimIdx	; Use this value from now on; save to info flash soon
-			mov		devThisIdx(SP),R8	; Save the deviations for debugging
-			mov		devThisIdx+2(SP),R9
-			mov		devThisIdx+4(SP),R10
-			mov		devThisIdx+6(SP),R11
-			add		#4+8,SP				; Deallocate locals
+			and.b	#$F0,&ramAdcTimIdx	; Set LS nibble to zero without disturbing MS nibble
+			or_b	R10,&ramAdcTimIdx	; Put new value to use into LS nibble. Save to info flash soon
+			add		#4+2*NumAdcClocks,SP ; Deallocate locals
 			ret
 
 ;

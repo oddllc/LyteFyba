@@ -32,7 +32,7 @@ MeasureBmuIsr:				; MeasCCR = TA1CCR0
 				and		#$7, R8					; (2)
 				mov.b	R8, &chanIndex			; (4)
 				bic		#ENC,&ADC10CTL0 		; (4) Must turn off ENC before ctl bits can be changed
-												;	This used to be outside the conditional cluase,
+												;	This used to be outside the conditional clause,
 												;	meaning that the whole ADC system, possibly
 												;	including the voltage ref, were turned off every
 												;	measurement. This resulted in a 6-10 mV difference
@@ -49,27 +49,63 @@ MeasureBmuIsr:				; MeasCCR = TA1CCR0
 
 ; The following table has the important timing bits for ADC10CTL1. It happens that they are
 ; all in the lower 8 bits, so this is a table of bytes.
-			; SHS_0		= enable software starting via the ADC10SC bit
 			; ADC10DIV_1 = divide input clock by 2 for ADC10CLK
 			; ADC10DIV_2 = divide input clock by 3 for ADC10CLK
             ; ADC10DIV_7 = divide input clock by 8 for ADC10CLK
-			; ADC10SSEL_0 = choose internal ADC clock (3-6 MHz) as input to ADC10CLK divider
-			; ADC10SSEL_2 = choose MCLK (4 MHz) as input to ADC10CLK divider
+			; ADC10SSEL_0 = choose internal ADC RC oscillator (3 to 6 MHz) as input to ADC10CLK divider
+			; ADC10SSEL_2 = choose MCLK (3.6864 MHz) as input to ADC10CLK divider
 			; CONSEQ_0	= single channel single conversion
 
-			; We found years ago that ADC10OSC/3 distributes noise particularly from SMCLK better, for
-			; more consistent ADC readings. But now they seem more noisy, especially for the Bolt+
-			; reading
-DFLT_ADC_TIMING	equ	ADC10DIV_2|ADC10SSEL_0|CONSEQ_0
-adcTimingTbl DB		DFLT_ADC_TIMING							; value = 0, default
-			DB		SHS_0+ADC10DIV_1|ADC10SSEL_2|CONSEQ_0	; 1 = MCLK/2
-			DB		SHS_0+ADC10DIV_1|ADC10SSEL_0|CONSEQ_0	; 2 = ADC10OSC/2 (may be too fast)
-			DB		SHS_0+ADC10DIV_2|ADC10SSEL_0|CONSEQ_0	; 3 = ADC10OSC/3
-			DB		SHS_0+ADC10DIV_3|ADC10SSEL_0|CONSEQ_0	; 4 = ADC10OSC/4
+			; We found years ago that ADC10OSC/3 distributes noise particularly from SMCLK better,
+			; for more consistent ADC readings. But now they seem more noisy, especially for the
+			; Bolt+ reading. ADC10CLK should not be faster than 1.67 MHz or slower than 0.15 MHz.
+DFLT_ADC_TIMING	equ	ADC10DIV_4|ADC10SSEL_2|CONSEQ_0	; Best for Monolith is usually MCLK/5 (index 11)
+AdcTimingTbl DB		DFLT_ADC_TIMING					; 0 = default, lowest worst-case noise
+			DB		ADC10DIV_1|ADC10SSEL_2|CONSEQ_0	; 1 = MCLK/2	 (may be too fast)
+			DB		ADC10DIV_1|ADC10SSEL_0|CONSEQ_0	; 2 = ADC10OSC/2 (may be too fast)
+			DB		ADC10DIV_2|ADC10SSEL_0|CONSEQ_0	; 3 = ADC10OSC/3 (may be too fast)
+			DB		ADC10DIV_3|ADC10SSEL_0|CONSEQ_0	; 4 = ADC10OSC/4
+			DB		ADC10DIV_4|ADC10SSEL_0|CONSEQ_0	; 5 = ADC10OSC/5
+			DB		ADC10DIV_5|ADC10SSEL_0|CONSEQ_0	; 6 = ADC10OSC/6
+			DB		ADC10DIV_6|ADC10SSEL_0|CONSEQ_0	; 7 = ADC10OSC/7
+			DB		ADC10DIV_7|ADC10SSEL_0|CONSEQ_0	; 8 = ADC10OSC/8
+			DB		ADC10DIV_2|ADC10SSEL_2|CONSEQ_0	; 9 = MCLK/3
+			DB		ADC10DIV_3|ADC10SSEL_2|CONSEQ_0	; 10 = MCLK/4
+			DB		ADC10DIV_4|ADC10SSEL_2|CONSEQ_0	; 11 = MCLK/5
+			DB		ADC10DIV_5|ADC10SSEL_2|CONSEQ_0	; 12 = MCLK/6
+			DB		ADC10DIV_6|ADC10SSEL_2|CONSEQ_0	; 13 = MCLK/7
+			DB		ADC10DIV_7|ADC10SSEL_2|CONSEQ_0	; 14 = MCLK/8
 			align	1
 
+;
+; Scale R8 by 17/16 if we're not a BMU
+; Trashes R9
+;
+Mul17Div16Cmu:
+		cmp.b	#255,&ID
+		_IF		NE			; If not a BMU then
+			; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
+			mov		R8,R9		; Copy the value
+			add		#8,R9		; Add half the divisor for rounding
+			rra4	R9			; Divide by 16
+			add		R9,R8		; Add back to the original
+		_ENDIF
+		ret
+
+ApplyTempCo:	; Make voltage readings more accurate when CMU is hot from bypassing
+				; by correcting for tempco of ADC voltage ref.
+				; Based on observations by Matthew James
+		mov.b	&cmuTemperature,R9
+		sxt		R9						; Sign extend byte to word
+		sub		#25,R9					; Subtract 25 degC
+		rra2	R9						; Divide by 4
+		adc		R9						; Round
+		sub		R9,R10					; Subtract the temperature correction
+		ret								; Finished
+
+
 ; Measure and Correct routines
-; Output: R10 = 12-bit measurement result with scale calibration applied.
+; Output: R10 = 12-bit measurement result with scale and offset calibration applied.
 ; Trashes: R8, R9, R11
 ;
 ; Correct the value for scale by multiplying the sum-of-samples by the voltage calibration scale factor
@@ -84,6 +120,8 @@ adcTimingTbl DB		DFLT_ADC_TIMING							; value = 0, default
 ; Used for battery voltage measurement in a BMU
 MeasAndCorrCell:
 			mov			&cellVRaw, R8			; 12.2 fixed-point result in R8
+			call		#Mul17Div16Cmu			; Scale by 17/16 if we're not a BMU
+MeasAndCorr:                                    ; Possible future entry point for TouchV and Vcc
 			mov.w		&CellCal,R9				; Get cell voltage calibration word as multiplicand in R9
 												; Multiplier is sum-of-samples, already in R8
 			call		#UMStar					; Gives unsigned product in R10 (hi word) and R9 (lo)
@@ -92,6 +130,7 @@ MeasAndCorrCell:
 			mov.b		&CellOff,R9				; Get the cell voltage offset as signed byte
 			sxt			R9						; Convert to signed word
 			add			R9,R10					; Add the offset calibration value
+			call		#ApplyTempCo			; Apply the temperature correction
 			ret									; Finished
 
 ; As above, using the separate bolt calibration factor and offset
@@ -99,6 +138,7 @@ MeasAndCorrCell:
 ; Trashes R8-11
 MeasAndCorrBoltPl:
 			mov			&boltVPlRaw, R8			; 12.2 fixed-point result in R8
+			call		#Mul17Div16Cmu			; Scale by 17/16 if we're not a BMU
 			mov.w		&BoltPlCal,R9			; Get bolt+ voltage scale factor as multiplicand in R9
 			cmp.w		#$FFFF,R9				; Check if it doesn't exist, i.e. just erased flash
 			_IF			EQ						; If it doesn't exist
@@ -111,6 +151,7 @@ MeasAndCorrBoltPl:
 			mov.b		&BoltPlOff,R9			; Get the bolt+ voltage offset as signed byte
 			sxt			R9						; Convert to signed word
 			add			R9,R10					; Add the offset calibration value
+			call		#ApplyTempCo			; Apply the temperature correction
 			ret									; Finished
 
 ; As above, using the separate bolt calibration factor and offset
@@ -136,14 +177,6 @@ GetCellV:
 ; Trashes: R8, R9, R11
 ; Output: R10 = calibrated in millivolts, approx range 0 to 4348
 			call	#MeasAndCorrCell
-			cmp.b	#255,&ID
-			_IF		NE			; If not a BMU then
-				; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
-				mov		R10,R8		; Copy the value
-				add		#8,R8		; Add half the divisor for rounding
-				rra4	R8			; Divide by 16
-				add		R8,R10		; Add back to the original
-			_ENDIF
 			ret
 
 
@@ -153,14 +186,6 @@ GetBoltPlV:
 ; Trashes: R8, R9, R11
 ; Output: R10 = calibrated in millivolts, approx range 0 to 4348
 			call	#MeasAndCorrBoltPl
-			cmp.b	#255,&ID
-			_IF		NE			; If not a BMU then
-				; Multiply by 17/16 to change full-scale from 4092 mV to 4348 mV
-				mov		R10,R8		; Copy the value
-				add		#8,R8		; Add half the divisor for rounding
-				rra4	R8			; Divide by 16
-				add		R8,R10		; Add back to the original
-			_ENDIF
 			ret
 
 
@@ -173,7 +198,7 @@ GetTemp:
 											; as stored in CAL30
 			add		#2,R8					; For rounding
 			rra2	R8						; Now 12.2 in 14.2 fixed point, still 2 bits shifted left
-			; Want (meas-CAL30) * SLOPE + 30 (see FUG 24.2.2.1)
+			; Want (meas-CAL30) * SLOPE + 30 (see Family User Guide 24.2.2.1)
 			mov		&CALADC_15T30,R9		; CAL30 10.0 significant in 16.0 fixed point
 			rla2	R9						; CAL30 10.0 significant in 14.2 fixed point
 			sub		R9,R8					; R8 has (meas-CAL30); could be negative
@@ -192,6 +217,7 @@ GetTemp:
 											; R10 now has temperature in whole degrees Celsius
 			add		#1,R9					; Rounding for divide by 2
 			rra		R9						; R9 has temperature in half degrees
+			mov.b	R10,&cmuTemperature		; Save temperature for use in correcting for ADC Vref tempco
 			ret
 
 GetBoltMiV:
@@ -224,10 +250,10 @@ GetBoltMiV:
 			ret
 
 #if INSULATION_MONITORING
-GetTouchV:
+GetTouchV:			; This can't work because TouchVChan is not included in the interrupt measurements
 ; Trashes: R8, R9, R11
 ; Output: R10 = uncalibrated reading (affected by optocoupler CTR), approx range 0 to 4092
-			mov		#TouchVChan<<12,R8
-			jmp		MeasAndCorrCell						; Tail-call MeasAndCorrCell and return
+			mov		#TouchVChan<<12,R8					; Need to call
+			jmp		MeasAndCorr							; Tail-call MeasAndCorr and return
 #endif // INSULATION_MONITORING
 

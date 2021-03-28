@@ -332,6 +332,29 @@ doMax:	; Emit another Max command with its last parameter max-ed with the
 ;		ret
 
 
+; Thresholds  ( stress0Voltage step 'V -- ) or (alarmStress 'aTh -- ) or
+; (bypassVoltage 'b -- ) or (fullVoltage 'f -- ).
+; Power-on defaults are equivalent to 3130 40'VTh  12'aTh  3410'bTh  3450'fTh (setpoint 7)
+; Possible alternative                3330 20'Vth  13'aTh  3410'bTh  3400'fTh (setpoint 4)
+		xCODE	'T'|'h' <<8,thresholds,_thresholds	; 'Th' collides with 'Tp' 'Tx' 'Lh' 'Lp' 'Lx'
+ 		_CASE
+			_OF_EQ	#'V',Rtos			; Set overvoltage zero and step
+				mov.b	Rsec,&ovStep		; ovStep = Rsec
+				mov		Rthd,&ovZero		; ovZero = Rthd
+			_ENDOF
+			_OF_EQ	#'a',Rtos			; Set alarm stress and BMU contactor-dropout stress
+				mov.b	Rsec,&alarmStress	; alarmStress = Rsec
+			_ENDOF
+			_OF_EQ	#'b',Rtos			; Set bypass voltage
+				mov		Rsec,&bypassVoltage	; bypassVoltage = Rsec
+			_ENDOF
+			_OF_EQ	#'f',Rtos			; Set full voltage
+				mov		Rsec,&fullVoltage	; fullVoltage = Rsec
+			_ENDOF
+		_ENDCASE
+		ret
+
+
 ; Current (tenths-of-an-amp -- ) // Sent by BMU to CMUs
 		xCODE	'i',Current,_Current
 		cmp.b	#255,&ID
@@ -390,16 +413,49 @@ SelectBMU	DB	4, '255s'				; First byte is length of following string
 		ret
 
 ;
-; GetOcCellVolt ( -- )
-; Transmit the smoothed estimated open circuit cell voltage in millivolts (0 to 4348 mV)
+; GetFiltOcCellVolt ( -- )
+; Transmit the filtered estimated open circuit cell voltage in millivolts (0 to 4348 mV)
 ;
-		xCODE		'O',GetOcCellVolt,_GetOcCellVolt
-		mov		&avgCellVoltX256+2,R9; Get upper word 0H
-		swpb	R9					; Move to upper byte of R9; R9 = H0
-		mov.b	&avgCellVoltX256+1,R8; Upper byte of lower word  R8 = 0M
-		or_w	R9, R8				; R8 has old value = HM = 0HML >> 8
-		mov		R8, Rsec
+		xCODE	'O',GetFiltOcCellVolt,_GetFiltOcCellVolt
+		mov		&ocCellVoltX256+2,R9; Get upper word into R9
+		mov		&ocCellVoltX256+0,R8; Get lower word into R8
+		add		#128,R8				; Add half the divisor for rounding
+		adc		R9
+		rra8_l	R9,R8				; Divide by 256
+		mov		R8, Rsec			; Number to print
 		mov		#'O',Rthd			; Command being responded to is 'O'
+		mov		#4,Rtos				; Use 4 digits
+		call	#_prettyPrint		; Call pretty-print
+		ret
+
+;
+; GetHiResFiltOcCellVolt ( -- )
+; Transmit the filtered estimated open circuit cell voltage in 1/16ths of a millivolt (0 to 65535 mV/16)
+; Voltages of 4096 to 4350 mV will wrap around and appear as voltages slightly greater than zero
+;
+		xCODE	'o',GetHiResFiltOcCellVolt,_GetHiResFiltOcCellVolt
+		mov		&ocCellVoltX256+2,R9; Get upper word into R9
+		mov		&ocCellVoltX256+0,R8; Get lower word into R8
+		add		#8,R8				; Add half the divisor for rounding
+		adc		R9
+		REPT	4					; Unsigned divide by 16
+			clrc
+			rrc		R9
+			rrc		R8
+		ENDR
+		mov		R8, Rsec			; Number to print
+		mov		#'o',Rthd			; Command being responded to is 'O'
+		mov		#6,Rtos				; Use 5 digits unsigned
+		call	#_prettyPrint		; Call pretty-print
+		ret
+
+;
+; GetOcCellVolt ( -- )
+; Transmit the estimated open circuit cell voltage in millivolts (0 to 4348 mV)
+;
+		xCODE	'W',GetOcCellVolt,_GetOcCellVolt
+		mov		&ocCellVolt,Rsec	; Get estimated open circuit cell voltage
+		mov		#'W',Rthd			; Command being responded to is 'W'
 		mov		#4,Rtos				; Use 4 digits
 		call	#_prettyPrint		; Call pretty-print
 		ret
@@ -479,6 +535,8 @@ SelectBMU	DB	4, '255s'				; First byte is length of following string
 ; Some characters need to be translated into RAM adresses of calibration values
 		ALIGN	1
 calAddressTable
+		DB		'b' , infoBypFull	& $7F | $00
+		DB		'a' , infoAdcTimIdx & $7F | $00
 		DB		'I' , infoBoltMiCal	& $7F | $80
 		DB		's' , infoTempSlope	& $7F | $80
 		DB		'O' , infoBoltPlOff	& $7F | $00
@@ -490,7 +548,6 @@ calAddressTable
 		DB		't' , infoTempOff	& $7F | $00	; clear for byte quantity
 		DB		'n' , infoBoltMiOff	& $7F | $00
 		DB		'i' , infoID		& $7F | $00
-		DB		'a' , infoAdcTimIdx & $7F | $00
 		DB		'd' , infoDataVers	& $7F | $00	; Data vers is not for writing
 ; Zero must not appear in the table as it is used to represent "unrecognised".
 sizeCalAddressTable	EQU	$-calAddressTable
@@ -515,6 +572,34 @@ TranslateToCalAddr:
 		ret
 
 ;
+; A worker routine for voltage calibration. We do this twice now for cell/battery and bolt/array
+;
+
+; The calibration scale factor will be the expected value divided by the reading.
+; The expected value is an unsigned 12 bit integer of millivolts and
+; the reading is an unsigned 12.2 bit fixed-point number of millivolts.
+; We want the calibration scale factor to be represented as an unsigned 1.15 fixed-point number
+; i.e. a number with 1 integer bit and 15 fractional bits.
+; So we shift the expected value 17 places left before the division.
+; R8 contains the measurement possibly scaled by 17/16
+; R9 contains the relevant (cell or array/bolt) offset correction as a signed byte
+; The cal value is returned in R9
+voltScaleWork:
+			sxt		R9							; Convert from signed byte to signed word
+			add		R9,R8						; Perform offset correction, but not scale correction
+			call	#ApplyTempCo				; Apply the temperature correction
+			clr		R9							; 16 bits of zeroes
+			mov		Rsec,R10
+			rla		R10							; 17 zeroes; we have value << 17 in R10:R9
+			mov		R8,R11						; The divisor is the voltage reading in R8
+			rra		R11							; Add half the divisor to the dividend for rounding
+			add		R11,R9
+			adc		R10
+			call	#UMSlashMod					; Gives quotient in R9, remainder in R10
+			; R9 has the value we want to store
+			ret
+
+;
 ; Calibrate ( n ch --- )
 ; Perform a calibration whose type is ch ('v for voltage etc) and value is n
 ; For the voltage scale and offset calibrations, we want to apply the other correction (i.e. scale if
@@ -523,9 +608,74 @@ TranslateToCalAddr:
 ;
 			xCODE	'c',calibrate,_calibrate
 			_CASE
+			_OF_EQ_B	#'v',Rtos				; 'v': Cell voltage scale factor
+				mov		&cellVRaw, R8				; 12.2 fixed-point result in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov.b	&CellOff,R9					; This is the offset correction to use
+				call	#voltScaleWork
+				mov.w	R9,R8						; Get the calibration value into R8
+				mov		#1,R9						; Save it as a word value
+				mov		#infoCellCal,R10			; Save it as the cell scale factor
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+			_ENDOF
 
-			_OF_EQ_B		#'n',Rtos				; 'n': Bolt-/Shuntx20 voltage offset. Was "link" offset
-				mov		#BoltVMiChan<<12,R8
+			_OF_EQ_B	#'V',Rtos				; 'V': Bolt+/Array voltage scale factor
+				mov		&boltVPlRaw,R8				; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov.b	&BoltPlOff,R9				; This is the offset correction to use
+				call	#voltScaleWork
+				mov.w	R9,R8						; Get the calibration value into R8
+				mov		#1,R9						; Save it as a word value
+				mov		#infoBoltPlCal,R10			; Save it as the cell scale factor
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+			_ENDOF
+
+			_OF_EQ_B	#'o',Rtos				; 'o': Cell voltage offset
+				mov		&cellVRaw, R8				; 12.2 fixed-point result in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov		&CellCal,R9					; Use this voltage scale for correction
+				call	#Fx1_15UMul					; Correct for scale but not offset
+				sub		R8,Rsec						; Calculate offset (expected - measured)
+				mov.b	Rsec,R8						; Get the calibration value into R8
+				mov		#0,R9						; Save it as a byte value
+				mov		#infoCellOff,R10			; Save it as the cell offset
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+			_ENDOF
+
+			_OF_EQ_B	#'O',Rtos				; 'O': Bolt+/Array voltage offset
+				mov		&boltVPlRaw,R8				; Get raw 12.2 bit fixed point measurement in R8
+				call	#Mul17Div16Cmu				; Scale by 17/16 if we're not a BMU
+				mov		&BoltPlCal,R9				; Use this voltage scale for correction
+				call	#Fx1_15UMul					; Correct for scale but not offset
+				sub		R8,Rsec						; Calculate offset (expected - measured)
+				mov.b	Rsec,R8						; Get the calibration value into R8
+				mov		#0,R9						; Save it as a byte value
+				mov		#infoBoltPlOff,R10			; Save it as the bolt plus offset
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+			_ENDOF
+
+			_OF_EQ_B	#'t',Rtos				; 't': Temperature offset
+				call	#GetTemp					; Get calibrated temp in half degC into R9
+				mov.b	&TempOff,R8					; Subtract off our existing offset calibration
+				sxt		R8
+				sub		R8,R9
+				push	R9							; Save uncalibrated measurement in half degrees
+				; Rsec is supplied in tenths of a degree now. Div by 5 to get half degrees
+				mov		#0,R10						; Put Rsec into R10:R9 as dividend
+				mov		Rsec,R9
+				add		#2,R9						; Add 2 for rounding
+				mov		#5,R8						; Divide by 5 to bring to half degrees
+				call	#UMSlashMod					; Result in R9
+				pop		R8							; Restore uncal'd measurement
+				sub		R8,R9						; Subtract measured half degrees from calibration
+													; (expected) temperature
+				mov.b	R9,R8						; Get the calibration value into R8
+				mov		#0,R9						; Save it as a byte value
+				mov		#infoTempOff,R10			; Save it as the temperature offset
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+			_ENDOF
+
+			_OF_EQ_B	#'n',Rtos				; 'n': Bolt-/Shuntx20 voltage offset. Was "link" offset
 				call	#MeasAndCorrBoltMi			; Measure and correct using the BoltMi corrections
 				mov.b	&BoltMiOff,R9				; Subtract the existing offset (signed byte)
 				sxt		R9
@@ -542,20 +692,21 @@ TranslateToCalAddr:
 				rla		R9							; To divide by 2^15, mult by 2 and keep the hi word
 				rlc		R10
 				mov		R10,Rsec
-				pop		R8
+				pop		R10
 
-				sub		Rsec,R8						; Subtract required reading * 1.364
-				neg		R8
+				sub		Rsec,R10					; Subtract required reading * 1.364
+				neg		R10
 				_COND								; Start a short-circuit conditional
-					cmp		#-$7F,R8					; Compare with -$7F
+					cmp		#-$7F,R10					; Compare with -$7F
 				_OR_ELSE	L						; If < -$7F
-					cmp		#$80,R8					; Compare with $80
+					cmp		#$80,R10					; Compare with $80
 				_OR_IFS		GE						; or >= $80
-					mov		#$80,R8					; Use $80 to indicate "not calibrated"
+					mov		#$80,R10					; Use $80 to indicate "not calibrated"
 				_ENDIF
-				mov			#0,R9				; Save the bolt-/current offset calibration value
-				mov			#infoBoltMiOff,R10
-				call		#UpdFlash
+				mov.b	R10,R8						; Get the calibration value into R8
+				mov		#0,R9						; Save it as a byte value
+				mov		#infoBoltMiOff,R10			; Save it as the bolt minus offset
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
 			_ENDOF
 
 			_OF_EQ_B	#'i',Rtos
@@ -589,6 +740,101 @@ TranslateToCalAddr:
 				_ENDIF
 				ret			; Don't fall through to _readCalValue
 			_ENDOF
+
+			_OF_EQ_B	#'a',Rtos				; 'a': optimal ADC timing, with debug display
+				call	#FindOptAdc					; Find the optimum ADC clock. Get index in R10
+				push 	R10							; Save the ADC timing index
+				sub		#2*NumAdcClocks,SP			; Recover the devThisIdx array from FindOptAdc
+
+				mov		#'M'|'2'<<8,Rthd			; M2 for MCLK/2
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'2'<<8,Rthd			; O2 for ADCOSC/2
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'3'<<8,Rthd			; O3 for ADCOSC/3
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'4'<<8,Rthd			; O4 for ADCOSC/4
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+ 				mov		#'O'|'5'<<8,Rthd			; O5 for ADCOSC/5
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'6'<<8,Rthd			; O6 for ADCOSC/6
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'7'<<8,Rthd			; O7 for ADCOSC/7
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'O'|'8'<<8,Rthd			; 08 for ADCOSC/8
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'3'<<8,Rthd			; M3 for MCLK/3
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'4'<<8,Rthd			; M4 for MCLK/4
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'5'<<8,Rthd			; M5 for MCLK/5
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'6'<<8,Rthd			; M6 for MCLK/6
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'7'<<8,Rthd			; M7 for MCLK/7
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov		#'M'|'8'<<8,Rthd			; M8 for MCLK/8
+				pop		Rsec
+				mov		#5,Rtos
+				call	#_prettyPrint
+
+				mov.b	#'a',Rtos					; Restore the calibration-type character
+
+				pop		R10							; Restore the ADC timing index
+				mov.b	AdcTimingTbl(R10),R9		; Get byte value from table
+				mov.b	R9, chanList+0				; Store it for each conversion channel
+				mov.b	R9, chanList+2
+				mov.b	R9, chanList+4
+				mov.b	R9, chanList+6
+
+
+				mov.b	&AdcTimIdx,R8				; Keep the existing TestICal timing in the LS nibble
+				and.b	#$0F,R8
+				rla4	R10							; Put the new Monolith timing in the MS nibble
+				or_b	R10,R8						; Get the calibration value into R8
+				mov		#0,R9						; Save it as a byte value
+				mov		#infoAdcTimIdx,R10			; Save it as the ADC timing index
+				call	#UpdFlash					; Save the R8 calibration value to info-flash
+				; Fall through to readCalValue to display the winner
+			_ENDOF
 ;
 ; Default case
 				jmp		EmitQmark					; Unknown calibration type character
@@ -605,34 +851,40 @@ TranslateToCalAddr:
 ; Read calibration value ( ch --- )
 ; Calibration type (e.g. 'v' for cell Voltage) in ch
 			xCODE	'r',readCalValue,_readCalValue
-			call 	#TranslateToCalAddr
-			mov.b	Rtos,Rsec				; Convert to info flash address in Rsec
-			bic.b	#$80,Rsec
-			or_w	#infoDataStart&$FF80,Rsec ; Copy higher bits from immediate address
+			call 	#TranslateToCalAddr		; Convert letter to byte/word flag and low 7 bits of address
+			mov.b	Rtos,Rsec				; Copy to Rsec
+			bic.b	#$80,Rsec				; Strip the byte/word flag
+			or_w	#infoDataStart&$FF80,Rsec ; OR the upper 9 bits to make it an info-flash address
 			tst.b	Rtos
 			_IF		NZ						; If not zero (zero means "unrecognised")
-				_IF		NN						; If high bit clear
+				push.b	&interpFlags			; Save present number base
+				_IF		NN						; If high bit clear it's a byte
 					mov		#3,Rtos					; Display 3 digits
+					cmp		#infoAdcTimIdx+1,Rsec	; Test for ADC timing index or BypFull
 					mov.b	@Rsec,Rsec				; Get byte sized cal value
-				_ELSE							; Else high bit set so
+					_IF		LO						; If we're reading ADC timing index or BypFull
+						bis.b	#bHexOutput,&interpFlags ; Set to hexadecimal output
+					_ENDIF
+				_ELSE							; Else high bit set so it's a word
 					mov		#5,Rtos					; Display 5 digits
 					cmp		#infoCapacity,Rsec		; Test for battery capacity
 					mov.w	@Rsec,Rsec				; Get word sized cal value
-					_IF		EQ
+					_IF		EQ						; If we're reading capacity
 						mov		Rsec,R9
 						clr		R10
-						mov		#10,R8				; Divide by 10 to bring to whole Ah
-						call	#UMSlashMod			; R10:R9 / R8 -> R9
+						mov		#10,R8					; Divide by 10 to bring to whole Ah
+						call	#UMSlashMod				; R10:R9 / R8 -> R9
 						mov		R9,Rsec
 					_ENDIF
-				_ENDIF							; Endif high bit
+				_ENDIF							; Endif high bit set
+				mov.b		#' ',Rthd			; Cmd type char (space). May be r or c command
+				call	 	#_prettyPrint
+				popBits_B	#bHexOutput,&interpFlags ; Restore previous number base
 			_ELSE 							; Else is zero for "unrecognised"
 EmitQmark
 				mov		#QuestionStr,R10
 				br		#TxString			; Print \? <ret> and exit
 			_ENDIF							; Endif unrecognised
-			mov.b		#' ',Rthd			; Cmd type char (space). May be r or c command
-			call	 	#_prettyPrint
 			ret
 
 QuestionStr	DB			3,'\\?\r'			; Initial \ because '?' is a peek command
@@ -656,35 +908,56 @@ TickIcStr	DB			3,'\'ic'			; 'ic command to send downstream
 
 			xCODE	'w',writeCalValue,_writeCalValue
 		_COND
-			cmp.b	#'i',Rtos					; Write an ID ?
-			_IF		EQ
-				cmp.b	#255,&ID					; BMUs have to stay ID=255
-				bit		#2,SR						; Invert the Z (EQ) bit (can't use xor)
+			cmp.b	#'d',Rtos				; Don't allow data version to be changed like this
+		_AND_IF	NE
+			_COND
+				cmp.b	#'i',Rtos				; Write an ID ?
+			_OR_ELSE	NE
+				cmp.b	#255,&ID				; BMUs have to stay ID=255
+			_OR_IFS		NE
+
+			call 	#TranslateToCalAddr		; Convert letter to byte/word flag and low 7 bits of address
+			mov.b	Rtos,R10				; Copy to R10
+			bic.b	#$80,R10				; Strip the byte/word flag
+			or_w	#infoDataStart&$FF80,R10 ; OR the upper 9 bits to make it an info-flash address
+
+			cmp		#infoCapacity,R10
+			_IF		EQ						; If we're writing battery capacity
+				rla		Rsec					; Multiply given value by 10
+				mov		Rsec,R8					; to bring to tenths of an Ah
+				rla2	Rsec					; *8
+				add		R8,Rsec					; *10
 			_ENDIF
-		_OR_ELSE	EQ
-			cmp.b	#'r',Rtos					; Cell internal resistance
-		_OR_ELSE	EQ
-			cmp.b	#'c',Rtos					; Battery capacity
-		_OR_ELSE	EQ
-			cmp.b	#'n',Rtos					; Bolt- or Shunt offset
-		_OR_IFS 	EQ
-			call 	#TranslateToCalAddr
-			mov.b	Rtos,R10					; Convert to info flash address in R10
-			bic.b	#$80,R10
-			or_w	#infoDataStart&$FF80,R10	; Copy higher bits from immediate address
-			cmp		#infoCapacity,R10			; Check for battery capacity
-			_IF		EQ							; If so
-				rla		Rsec						; Multiply given value by 10
-				mov		Rsec,R9						; to bring to tenths of an Ah
-				rla2	Rsec						; *8
-				add		R9,Rsec						; *10
-			_ENDIF
+
+			_COND							; If we're writing cell or bolt+ voltage scale cal constant
+				cmp		#infoCellCal,R10
+			_OR_ELSE EQ
+				cmp		#infoBoltPlCal,R10
+			_OR_IFS	EQ
+				_COND							; If Rsec is between -30 and 30 inclusive
+					cmp		#30+1,Rsec
+				_AND_IF	L
+					cmp		#-30,Rsec
+				_AND_IF GE
+					rla		Rsec					; Multiply Rsec by 10
+					mov		Rsec,R8
+					rla2	Rsec
+					add		R8,Rsec
+					add		@R10,Rsec				; Add the existing value of the cal constant to Rsec
+				_ELSES							; Else
+					cmp		#'v',Rsec				; If Rsec is 'v
+					_IF		EQ
+						mov		&infoCellCal,Rsec		; Set Rsec to the cell voltage scale cal const
+					_ENDIF							; Endif
+				_ENDIF							; Endif
+			_ENDIF							; Endif
+
 			tst.b	Rtos
 			_IF		NZ						; If not zero for "unrecognised"
 				_IF		NN						; If high bit clear
-					mov		#0,R9					; Indicate byte size
+					mov		#0,R9					; Indicate byte sized cal value
 				_ELSE							; Else high bit set so
-					mov.w	#1,R9					; Indicate word sized cal value
+					mov		#1,R9					; Indicate word sized cal value
 				_ENDIF							; Endif high bit
 				mov		Rsec,R8					; Data to be written
 				call	#UpdFlash			; Write new value to flash
@@ -692,10 +965,9 @@ TickIcStr	DB			3,'\'ic'			; 'ic command to send downstream
 				jmp		EmitQmark
 			_ENDIF							; Endif unrecognised
 			ret
-		_ELSE							; Not a valid ch for monolith 'w' command
-			jmp		EmitQmark
+		_ELSES
+				jmp		EmitQmark
 		_ENDIF
-
 
 ;
 ;
@@ -756,7 +1028,7 @@ UpdFlash:
 			;
 			call	#compareInfoFlash		; Compare RAM cal data with what's in infoflash
 			mov		#1+4+1,R11				; String length
-			_IF    NE
+			_IF		NE
 				mov		#sFail,R10
 			_ELSE
 				mov		#sDone,R10
@@ -787,4 +1059,136 @@ compareInfoFlash:
 				_ENDIF
 			; The increment will have set Z if all compares well. The cmp will have cleared Z otherwise.
 			ret
+
+;
+; Determine the best ADC clock value for this CMU when running Monolith.
+; Assumes the CMU is bolted to a cell carrying no current so v and V measure a constant voltage.
+; Can be used for BMUs if v and V (HazBat & HazArr) are measuring a constant voltage of 48 V or more.
+; Trashes R8-12, R13, R15
+;
+FindOptAdc:
+
+; Local variable stack pointer offsets
+actCellV	EQU		0					; Our best guess of the actual cell voltage, which is the
+										; average of 256 measurements using GetCellV and MCLK/3
+										; Also used as a 32-bit sum of these values to find the average
+										; The deviations from this are used to determine the noise
+devThisIdx	EQU		4					; Array of total deviation word-sized results
+
+; Conditional assembly used during testing
+#define		USE_CELLV 0					; Set this if you want to use CellV instead of BoltPlV
+										; We normally use BoltPlV because it is more noisy
+numMeasures	EQU		16					; How many measurements to make with each clock. A power of 2.
+logNumMeas	EQU		4					; Base 2 log of the above. 'ac takes 0.6 seconds per measure.
+
+			sub		#4+2*NumAdcClocks,SP	; Make space for locals
+			mov		SP,R9
+			_FOR	#2+NumAdcClocks,R12
+				clr		0(R9)				; Clear locals
+				incd	R9
+			_NEXT_DEC	R12
+			; Measure using the timing that has the lowest worst-case noise for monolith
+#if USE_CELLV
+			mov.b	&AdcTimingTbl+0,&chanList+4	; Temporarily change the CellV ADC timing
+#else
+			mov.b	&AdcTimingTbl+0,&chanList+0	; Temporarily change the BoltPlV ADC timing
+#endif
+			_FOR	#numMeasures,R12	; Do this many measurements
+				; We use BoltPlV because it is a noiser measurement than CellV,
+				; because its track on a CMU runs parallel to some noisy other tracks.
+				; We used to use CellV here, but we need to use the same measurement we use below
+				; in case they have different readings e.g. because they are calibrated differently.
+#if USE_CELLV
+				call	#GetCellV			; Little-v is less noisy
+#else
+				call	#GetBoltPlV			; Big-V is more noisy
+#endif
+				add		R10,actCellV(SP)	; Accumulate sum
+				adc		actCellV+2(SP)		; as 32-bit
+				mov		#40,R8				; Wait 40 ms for next measurement
+				call	#DelayMs
+			_NEXT_DEC	R12
+			; Find the average
+			mov		actCellV+2(SP),R10	; Get sum into R10:R9
+			mov		actCellV(SP),R9
+			add		#numMeasures/2,R9	; Rounding
+			adc		R10
+#if logNumMeas == 8
+			rra8_l	R10,R9				; Shift longword right 8 bits using macro, to divide by 256
+#else
+		REPT	logNumMeas				; Shift longword right the required number of bits
+			clrc						; Unsigned
+			rrc		R10
+			rrc		R9
+		ENDR
+#endif
+			mov		R9,actCellV(SP)		; Save average cell voltage as the actual word value in mV
+			; We want the best total deviation from the "actual" cell voltage. We use the total
+			; rather than the worst deviation since we've observed some infrequent large errors, and
+			; others with frequent almost-as-large errors. We want to penalise the frequent errors more.
+			; Take 256 measurements, and sum their deviations from actual in sumOfDev. We don't bother
+			; dividing by 256, so there won't be an overflow of 16 bits unless the average error is
+			; 256 mV or more.
+			clr		R15					; R15 will range 0 to NumAdcClocks-1
+			mov		SP,R13
+			add		#devThisIdx,R13		; R13 points to the start of the devThisIdx array
+			_REPEAT
+#if USE_CELLV
+				mov.b	AdcTimingTbl+1(R15),&chanList+4	; Use this ADC timing for CellV
+#else
+				mov.b	AdcTimingTbl+1(R15),&chanList+0	; Use this ADC timing for BoltPlV
+#endif
+				_FOR	#numMeasures,R12	; Do this many measurements
+					; We use BoltPlV because it is a noiser measurement than CellV,
+					; because its track on a CMU runs parallel to some noisy other tracks.
+#if USE_CELLV
+					call	#GetCellV			; Little-v is less noisy
+#else
+					call	#GetBoltPlV			; Big-V is more noisy
+#endif
+					sub		actCellV(SP),R10	; Get deviation from average
+					abs		R10					; Don't care if pos or neg
+					add		R10,0(R13)			; Accumulate the sum of the deviations into the array
+					mov		#40,R8				; Wait 40 ms for next measurement
+					call	#DelayMs
+				_NEXT_DEC	R12
+				incd	R13					; Point to next array entry
+				inc		R15					; Next index
+				cmp		#NumAdcClocks,R15
+			_UNTIL	EQ
+#if USE_CELLV
+			mov.b	&chanList+0,&chanList+4	; Restore ADC timing for CellV
+#else
+			mov.b	&chanList+4,&chanList+0	; Restore ADC timing for BoltPlV
+#endif
+			; Now find the quietest result
+			clr		R15
+			mov		#-1,R10				; Default winner
+			mov		#$FFFF,R8			; Worst so far
+			mov		SP,R13
+			add		#devThisIdx,R13		; R13 points to start of devThisIdx array
+			_REPEAT
+				cmp		@R13+,R8			; Compare lowest so far with table
+				_IF		HS					; If the lowest so far is higher than this table entry
+					mov		-2(R13),R8			; A new lowest noise
+					mov		R15,R10				; Remember the table index
+				_ENDIF
+				inc		R15
+				cmp		#NumAdcClocks,R15
+			_UNTIL	EQ
+
+			; The lowest noise result was with a table index of R10, corresponding to an ADC timing
+			; index of R10+1
+			add		#1,R10				; Use this value from now on; save to info flash soon
+			add		#4+2*NumAdcClocks,SP ; Deallocate locals
+			ret
+
+
+; Cell temperature ( -- ) ; Not updated during bypassing so it is not merely CMU temperature
+		xCODE	'T'|'c'<<8,CellTemp,_CellTemp ; 'Tc' collides with 'Ta' 'Tk' 'Ts' 'La' 'Lc' 'Lk' 'Ls'
+		mov		#'T'|'c' <<8,Rthd		; Command being responded to
+		mov.b	&cellTemperature,Rsec	; Get cell temperature
+		sxt		Rsec					; Sign extend byte to word
+		mov		#2,Rtos					; Print 2 digits
+		br		#_prettyPrint			; Tail-call pretty-print and return
 

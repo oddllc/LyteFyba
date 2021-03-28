@@ -165,22 +165,37 @@ _emitNum3:
 #if 1	// This version takes up 7 more words of flash but doesn't use any stack (except return address)
 		mov		#4,R12				; Loop 5 times for decimal conversion
 		bit.b	#bHexOutput,&interpFlags ; Hexadecimal or decimal?
-		_IF		Z					; If decimal, treat as a signed number
-			tst		Rsec
-			_IF		L					; If n is negative
-				mov.b	#'-',R8				; Emit minus sign
-				call	#TxByteCk
-				inv		Rsec				; Negate to get absolute value
-				inc		Rsec
-			_ENDIF						; Endif negative
+		_IF		Z					; If decimal, treat as a signed number unless count >= 6
+			cmp		#6,Rtos
+			_IF		LO					; If count < 6
+				tst		Rsec
+				_IF		L					; If n is negative
+					mov.b	#'-',R8				; Emit minus sign
+					call	#TxByteCk
+					inv		Rsec				; Negate to get absolute value
+					inc		Rsec
+				_ENDIF						; Endif negative
+			_ENDIF						; Endif count <= 5
 			mov		Rsec,R10			; Get n as 16.16 bit fixpoint Dividend in R10:R9
+			clr		R9
+			clrc						; Unsigned divide by 2
+			rrc		R10
+			rrc		R9
 			mov		#40000,R8			; Divisor in R8 is 4 * 10^4
-			mov		R8,R9				; Instead of clearing R9 and adding one to the quotient later
-			call	#UMSlashMod			; R10:R9 / R8 -> R9, remainder to R10 (ignored), clears R11
-			clr		R10					; Ignore remainder. Treat R10:R9 as 16.16 bit fixpoint again
-			rla		R9					; Shift R10:R9 2 bits left
-			rlc		R10					; to get most sig decimal digit in R10 (max value 3)
-			rla		R9
+			call	#UMSlashMod			; R10:R9 / R8 -> R9, remainder in R10, clears R11
+			mov		R10,R8				; Get remainder in R8
+			clr		R10					; Treat R10:R9 as 16.16 bit fixpoint again
+			add		#8192,R8			; Add 8192 to the remainder for later rounding. Won't carry now.
+			rla		R8					; Multiply the remainder by 2
+			adc		R9					; if there's a carry, add it to the quotient
+			rla		R8					; Shift R10:R9:R8 3 bits left
+			rlc		R9					; to get most sig decimal digit in R10 (max value 6)
+			rlc		R10
+			rla		R8
+			rlc		R9
+			rlc		R10
+			rla		R8
+			rlc		R9
 			rlc		R10
 			mov		#10,Rsec			; Rsec := 10 (radix)
 		_ELSE						; Else hexadecimal
@@ -217,14 +232,17 @@ _emitNum3:
 
 #else	// This version of emitNum takes less flash but uses up to 8 bytes of stack to reverse digits
 		bit.b	#bHexOutput,&interpFlags ; Hexadecimal or decimal?
-		_IF		Z					; If decimal, treat as a signed number
-			tst		Rsec
-			_IF		L					; If n is negative
-				mov.b	#'-',R8				; Emit minus sign
-				call	#TxByteCk
-				inv		Rsec				; Negate
-				inc		Rsec
-			_ENDIF						; Endif negative
+		_IF		Z					; If decimal, treat as a signed number unless count >= 6
+			cmp		#6,Rtos
+			_IF		LO					; If count < 6
+				tst		Rsec
+				_IF		L					; If n is negative
+					mov.b	#'-',R8				; Emit minus sign
+					call	#TxByteCk
+					inv		Rsec				; Negate
+					inc		Rsec
+				_ENDIF						; Endif negative
+			_ENDIF						; Endif count <= 5
 			mov.b	#10,R8			; Divisor in R8 is number base
 		_ELSE						; Else hexadecimal
 			dec		Rtos				; Use one less digit
@@ -284,10 +302,10 @@ _emitNum3:
 		jmp			_prettyPrint		; Tail-call pretty-print and return
 
 ;
-; Cell temperature measurement ( -- )
-; Transmit cell temperature in degrees C
+; CMU temperature measurement ( -- )
+; Transmit cmu temperature in degrees C
 ;
-		xCODE		't',GetCellTemp,_GetCellTemp
+		xCODE		't',GetCmuTemp,_GetCmuTemp
 		call		#GetTemp			; Return temperature in degrees Celsius in R10
 		mov			#'t',Rthd			; Type is temperature
 										; Don't use degree symbol ($F8 Terminal font). Looks like status
@@ -298,7 +316,7 @@ _emitNum3:
 #ifdef	KINGSCLIFF_DCM
 ;
 ; External thermistor temperature measurement ( -- )
-; Transmit cell temperature in degrees C
+; Transmit thermistor temperature in degrees C
 ;
 		xCODE		'H',GetExtTemp,_GetExtTemp
 		call		#extT				; Return temperature in degrees Celsius in R10
@@ -322,22 +340,20 @@ _emitNum3:
 		jmp			_prettyPrint		; Tail-call pretty-print and return
 
 
+; Link voltage (max abs volt drop across any terminal) returned in R10
 GetLinkV:
-		call		#GetBoltMiV			; Return bolt- or shuntx20 in mV in R10
+		call		#GetBoltMiV			; Get bolt- or shuntx20 in mV in R10
+		; If we're a BMU, we're done. This is deprecated. Use 'Is' for BMU current shunt value
 		cmp.b	#255,&ID
-		_IF		EQ						; If we're a BMU
-			mov			R10,Rsec			; Result to Rsec
-		_ELSE
+		_IF		NE						; If we're a CMU
 			abs			R10					; Absolute value: easier to compare, and sign is meaningless
-											;	unless you know whether pos or neg strap!
-			push		R10					; Remember this neg term value
-			mov			#CellVChan<<12,R8	; Shifted ADC channel for CellV voltage divider
-			call		#MeasAndCorrCell
-			push		R10					; Save strap voltage
-			mov			#BoltVPlChan<<12,R8 ; Shifted ADC channel for BoltVPl voltage divider
-			call		#MeasAndCorrBoltPl	; Measure and correct using the BoltPL corrections
-			sub			R10,0(SP)			; TOS has bolt/array - cell/battery
-			pop			R10					; R10 has pos term strap drop
+											;	unless you know whether pos or neg terminal!
+			push		R10					; Remember this negative-terminal drop
+			call		#GetCellV			; Get strap+ voltage in R10
+			push		R10					; Save strap+ voltage
+			call		#GetBoltPlV			; Get bolt+ voltage in R!0 corrections
+			sub			R10,0(SP)			; TOS has drop = bolt - strap
+			pop			R10					; Get positive-terminal drop into R10
 			abs			R10					; Absolute value
 			cmp			R10,0(SP)			; Compare pos and neg drops
 			_IF			LO					; If 0(SP) < R10
@@ -352,28 +368,25 @@ GetLinkV:
 ; Display in signed millivolts, -1500 to 1500 or 9999 for "invalid".
 ; Corresponds to fifths of an amp with a 200 A 50 mV shunt
 		xCODE		'l',LinkVolt,_LinkVolt
-		call		#GetLinkV			; Get the worst link voltage
-		mov			R10,Rsec			; To Rsec for display
+		call		#GetLinkV			; Get the worst link voltage in R10
+		mov			R10,Rsec			; Copy it to Rsec for display
 		mov			#'l',Rthd			; Type is Link voltage
 		mov			#4,Rtos				; Print 4 digits
 		jmp			_prettyPrint		; Tail-call pretty-print and return
 
 ;
-; Measure Vcc ( -- )	; Emit the Vcc voltage in millivolts
-;
-		xCODE	'M'|'v' <<8,MeasVcc,_MeasVcc	; 'Mv' collides with 'Mf' 'Mn' 'Uv' 'Uf' 'Un'
-		xCODE	'o',MeasVcc2,_MeasVcc2			; 'o' alias to allow keyboard auto-repeat when testing
-		mov		#0xB<<12,R8				; Choose the internal half-supply analog input
-		call	#MeasAndCorrCell		; Gives us 0-4092 in R10, for 0-1.5 V
-		mov		R10,R8
-		mov		#48047,R9				; 3000/4092*65536
-		call	#UMStar					; R10:R9 = R8 * R9
-		rla		R9						; Do rounding
-		adc		R10
-		mov		#'M'|'v' <<8,Rthd		; Type is Vcc Measurement
-		mov		R10,Rsec				; Result in millivolts
-		mov		#4,Rtos					; Print 4 digits
-		br		#_prettyPrint			; Tail-call pretty-print and return
+; Positive terminal volt drop for CMU, Positive contactor volt drop for BMU ( -- )
+; Big-V minus little-v. Display in signed millivolts, -4348 to 4348
+		xCODE		'P'|'d' <<8,PosDrop,_PosDrop; 'Pd' collides with 'Pl', 'Pt', 'Xd', 'Xl', 'Xt'
+		xCODE		'a',AddAlt,_AddAlt			; 'a' alias to allow keyboard auto-repeat when testing
+												; Mnemonic for 'a' is "additive alteration"
+		call		#GetBoltPlV			; Get the bolt+ voltage in R10
+		mov			R10,Rsec			; Copy it to Rsec for display
+		call		#GetCellV			; Get the strap+ voltage in R10
+		sub			R10,Rsec			; Subtract strap+ from bolt+ in Rsec
+		mov			#'P'|'d'<<8,Rthd	; Characters of command being responded to
+		mov			#4,Rtos				; Print 4 digits
+		jmp			_prettyPrint		; Tail-call pretty-print and return
 
 
 #if INSULATION_MONITORING
@@ -1153,7 +1166,7 @@ abortColon
 ; For the first Genevo Demand Charge Management system at Kingscliff TAFE
 CAP_TOTV	EQU		16 * 32					; Nominal total volltage in decivolts. 16 cells at 3.2 V
 
-		xCODE	'@',Capacity,_Capacity	; At sign, think "capATcity"
+		xCODE	'@',Capatcity,_Capatcity	; At sign, think "capATcity"
 		_CASE
 		_OF_EQ_B	#$B,Rtos			; $B: Battery total nominal voltage (0.1 V)
 			mov		#CAP_TOTV,Rsec
@@ -1196,3 +1209,17 @@ EnergyCap:		; Return energy capacity in R9. Trashes R8, R10, R11
 		xCODE		'B'|'r' <<8,break,_break ; 'Br' collides with 'Bb' 'Bj' 'Bz' 'Zr' 'Zb' 'Zj' 'Zz'
 		br	#jWriteBreak			; Tail call and return
 
+
+; Turn off echoing of commands. Useful to stop the last CMU echoing when used without master.
+		xCODE	'[',CmdEchoOff,_CmdEchoOff
+		bit.b	#bDontInterpret,&interpFlags
+		_IF		Z				; If the dont-interpret flag is clear
+			bis.b	#bDontEcho | bEchoResponses,&interpFlags    ; Don't want to echo command packets
+                                                                ; Do want to see responses
+		_ENDIF
+		ret
+
+; Turn on echoing of commands. Useful to start the last CMU echoing when used without master.
+		xCODE	']',CmdEchoOn,_CmdEchoOn
+		bic.b	#bDontEcho | bEchoResponses,&interpFlags ; Echo everything
+		ret
